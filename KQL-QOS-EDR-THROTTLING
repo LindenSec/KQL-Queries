@@ -1,0 +1,32 @@
+let lookback = 30d;
+let SecurityBinaries = dynamic([
+    "MsSense.exe","SenseIR.exe","SenseNdr.exe","SenseCncProxy.exe","MsMpEng.exe",
+    "NisSrv.exe","MpDefenderCoreService.exe","MpCmdRun.exe","wdswfsafe.exe","WinDefend.exe",
+    "falcon-sensor.exe","CSFalconService.exe","SentinelAgent.exe","SentinelServiceHost.exe",
+    "CortexXDR.exe","cyserver.exe","cyvera.exe","cb.exe","elastic-agent.exe","HarfangLab.exe"
+]);
+let PS =
+    DeviceEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType == "PowerShellCommand"
+    | extend PSCommand = tostring(parse_json(AdditionalFields).Command);
+// processes that created a throttling QoS policy via PowerShell
+let QoSProcs =
+    PS
+    | where PSCommand has_any ("New-NetQosPolicy","Set-NetQosPolicy")
+    | where PSCommand has_any ("AppPathNameMatchCondition","ThrottleRateAction")
+    | distinct DeviceId, InitiatingProcessId, InitiatingProcessCreationTime;
+// rejoin ALL commands from those processes to recover variable contents (the target list)
+PS
+| join kind=inner QoSProcs on DeviceId, InitiatingProcessId, InitiatingProcessCreationTime
+| extend HitsSecurityBinary = PSCommand has_any (SecurityBinaries)
+| summarize
+    AllCommands               = make_set(PSCommand, 200),
+    TargetedBinaryCommands    = make_set_if(PSCommand, HitsSecurityBinary, 50),
+    FirstSeen                 = min(Timestamp),
+    LastSeen                  = max(Timestamp)
+    by DeviceId, DeviceName, InitiatingProcessId,
+       AccountName = InitiatingProcessAccountName,
+       RemoteSessionIP = InitiatingProcessRemoteSessionIP
+| extend SuspectActivity = "PowerShell QoS EDR-throttling sequence (loop + target list)"
+| sort by LastSeen desc
